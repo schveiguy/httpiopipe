@@ -1,0 +1,7 @@
+name "httpiopipe"
+description "http client library for iopipe"
+authors "Steven Schveighoffer"
+copyright "Copyright © 2018, Steven Schveighoffer"
+license "Boost 1.0"
+dependency "iopipe" version="~>0.1.2"
+dependency "io" version="~>0.2.2"
