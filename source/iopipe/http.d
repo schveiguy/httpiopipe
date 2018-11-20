@@ -11,14 +11,85 @@
 module iopipe.http;
 
 import iopipe.bufpipe;
+import iopipe.textpipe;
+import iopipe.valve;
+import iopipe.traits;
 import iopipe.zip;
+import std.string;
+import std.conv;
 
 enum Channel : ubyte
 {
     normal,
     compressed,
-    chunked,
-    chunkedCompressed
+    /*chunked,
+    chunkedCompressed*/
+}
+
+struct Cookie
+{
+    string name;
+    string value;
+    // TODO: parse the directives and use them to direct behavior
+    string[2][] directives;
+}
+
+Cookie parseCookie(string info) @safe pure
+{
+    import std.algorithm : splitter;
+
+    Cookie result;
+    auto items = info.splitter(';');
+    // parse name and value
+    assert(!items.empty);
+    auto nvpair = items.front.strip.splitter('=');
+    assert(!nvpair.empty);
+    result.name = nvpair.front;
+    nvpair.popFront;
+    assert(!nvpair.empty);
+    result.value = nvpair.front;
+    nvpair.popFront;
+    assert(nvpair.empty);
+
+    // parse off each directive
+    items.popFront;
+    foreach(item; items)
+    {
+        string[2] directive;
+        nvpair = item.strip.splitter('=');
+        // ignore empty directives
+        if(nvpair.empty)
+            continue;
+        directive[0] = nvpair.front;
+        nvpair.popFront;
+        directive[1] = nvpair.front;
+        nvpair.popFront;
+        assert(nvpair.empty); // should be a=b format, not a=b=x format.
+        result.directives ~= directive;
+    }
+
+    return result;
+}
+
+// header information
+struct HttpHeader
+{
+    int code;
+    string codeText;
+    string httpVersion;
+    string statusLine;
+    string location;
+    string contentType;
+    int contentLength;
+    Cookie[] cookies;
+    string[] rawHeaders; // headers before they were parsed
+    string[2][] headers; // parsed well-formed headers
+
+}
+
+auto httpChunkPipe(Chain)(Chain chain)
+{
+    assert(false, "Unimplemented");
 }
 
 
@@ -26,6 +97,8 @@ enum Channel : ubyte
 // get this, but the content is still streamed via the underlying pipe.
 struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe == ubyte[]))
 {
+    import std.meta : AliasSeq;
+
     private HttpHeader _headers;
     HttpClient client;
     ref const(HttpHeader) headers() const { return _headers; }
@@ -35,8 +108,8 @@ struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe == uby
     private alias PipeTypes = AliasSeq!(
            BasePipe,
            typeof(unzip(BasePipe.init)),
-           ChunkedPipe,
-           typeof(unzip(ChunkedPipe.init))
+           /*ChunkedPipe,
+           typeof(unzip(ChunkedPipe.init))*/
            );
 
     private union
@@ -45,7 +118,7 @@ struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe == uby
     }
 
     private Channel channel;
-    private ubyte[] _cachedwindow;
+    private ubyte[] _cachedWindow;
 
     static if(hasValve!BasePipe)
     {
@@ -250,10 +323,15 @@ struct Uri
         return n;
     }
 }
+
+struct HttpQueryParameters
+{
+}
  
 /// HttpClient keeps cookies, location, and some other state to reuse connections, when possible, like a web browser.
 class HttpClient
 {
+    import std.io.net.socket;
     /* Protocol restrictions, useful to disable when debugging servers */
     bool useHttp11 = true; ///
     bool acceptGzip = true; ///
@@ -279,14 +357,17 @@ class HttpClient
         return request(where, method, parameters);
     }
 
-    HttpRequest request(Uri where, HttpVerb method = HttpVerb.GET,
+    auto request(Uri where, HttpVerb method = HttpVerb.GET,
                         HttpQueryParameters parameters = HttpQueryParameters.init)
     {
 
-        auto sock = openConnection(where.host, where.port, where.scheme == "https").refCounted;
+        import std.typecons : refCounted;
+        import std.algorithm : splitter;
+
+        auto sock = openConnection(where.host, where.scheme == "https", cast(short)where.port).refCounted;
 
         // got a socket, need to send the request parameters
-        auto requestBuffer = bufd!char.push!(a => a.outputPipe(sock), false);
+        auto requestBuffer = bufd!char.push!(a => a.encodeText.outputPipe(sock), false);
 
         // write header data to the socket
         void hdr(const(char)[][] data...)
@@ -332,6 +413,9 @@ class HttpClient
         if(userAgent.length)
             hdr("User-Agent: ", userAgent, "\r\n");
 
+        if(authorization.length)
+            hdr("Authorization: ", authorization, "\r\n");
+
         if(acceptGzip)
             hdr("Accept-Encoding: gzip\r\n");
 
@@ -339,11 +423,12 @@ class HttpClient
         requestBuffer.flush();
 
         // now, generate a resulting pipe based on the response data.
+        // TODO: reuse the buffer to receive as well.
         auto resultPipe = sock
             .bufd        // buffer it
             .simpleValve // Allow us to get back to the original buffered socket.
             .assumeText  // assume UTF-8 (ascii)
-            .byLinePipe; // convert to lines
+            .byLine;     // convert to lines
 
         resultPipe.extend(0);
         // first line is the status line
@@ -369,17 +454,22 @@ class HttpClient
         while(true)
         {
             // throw away the current line, parse the next one
-            resultPipe.release(resultPipe.window);
+            resultPipe.release(resultPipe.window.length);
             resultPipe.extend(0);
-            line = resultPipe.window.strip.dup;
-            responseData.headers ~= line;
-            auto colon = header.indexOf(':');
+            auto tmpline = resultPipe.window.strip;
+            if(tmpline.length == 0)
+                // end of headers
+                break;
+            line = tmpline.idup;
+            responseData.rawHeaders ~= line;
+            auto colon = line.indexOf(':');
             if(colon == -1)
                 // not a well-formed header, don't worry about processing it.
                 continue;
 
             auto name = line[0 .. colon];
             auto value = line[colon + 2 .. $]; // skipping the colon itself and the following space
+            responseData.headers ~= cast(string[2])[name, value];
             switch(name) {
             case "Connection":
             case "connection":
@@ -398,7 +488,7 @@ class HttpClient
                 break;
             case "Content-Length":
             case "content-length":
-                responseData.contentLengthRemaining = to!int(value);
+                responseData.contentLength = to!int(value);
                 break;
             case "Transfer-Encoding":
             case "transfer-encoding":
@@ -420,7 +510,7 @@ class HttpClient
                 break;
             case "Set-Cookie":
             case "set-cookie":
-                // FIXME handle
+                responseData.cookies ~= parseCookie(value);
                 break;
             default:
                 // ignore
@@ -428,11 +518,14 @@ class HttpClient
             }
         }
 
-        // fetch the original socket, unwrapping all the text conversions, and
-        // unzip if necessary.
+        // make sure any lingering header data is out of the pipe
+        resultPipe.release(resultPipe.window.length);
+
+        // fetch the original socket, unwrapping all the text conversions and
+        // line processing, and build the appropriate decoder on top of it.
         auto origSocket = resultPipe.valve;
-        auto pipe = HttpPipe!(typeof(origSocket));
-        pipe.headers = responseData;
+        HttpPipe!(typeof(origSocket)) pipe;
+        pipe._headers = responseData;
 
         // deal with any encoding issues.
         if(isChunked)
@@ -444,28 +537,45 @@ class HttpClient
             if(isCompressed)
             {
                 pipe.pipes[Channel.compressed] = origSocket.unzip;
+                pipe.channel = Channel.compressed;
             }
             else
             {
                 pipe.pipes[Channel.normal] = origSocket;
+                pipe.channel = Channel.normal;
             }
         }
-        return HttpPipe!(typeof(origSocket))(origSocket);
+        return pipe;
     }
 
-    private Socket openConnection(string hostname, int port, bool ssl)
+    private Socket openConnection(string hostname, bool ssl = false, short port = 0)
     {
         // no support for ssl yet
         assert(!ssl);
-    }
 
+        auto result = Socket(ProtocolFamily.IPv4, SocketType.stream);
+        // determine the host ipaddr, based on name service
+        import std.io.driver;
+        import std.io.net;
+        auto rc = driver.resolve(hostname ~ '\0', ssl ? "http" : "https", AddrFamily.IPv4, SocketType.stream, Protocol.default_, (ref scope ai) {
+              // set the port according to the parameter
+              auto addr4 = ai.addr.get!SocketAddrIPv4;
+              if(port != 0)
+                  addr4.port = port;
+              result.connect(addr4);
+              return 1;
+          });
+        if(rc != 1)
+            throw new Exception("Cannot resolve host: " ~ hostname);
+        return result.move;
+    }
 
     /++
         Creates a request without updating the current url state
         (but will still save cookies btw)
 
         +/
-        HttpRequest request(Uri uri, HttpVerb method = HttpVerb.GET, ubyte[] bodyData = null, string contentType = null) {
+        /*HttpRequest request(Uri uri, HttpVerb method = HttpVerb.GET, ubyte[] bodyData = null, string contentType = null) {
             auto request = new HttpRequest(uri, method);
 
             request.requestParameters.userAgent = userAgent;
@@ -484,41 +594,55 @@ class HttpClient
     /// ditto
     HttpRequest request(Uri uri, FormData fd, HttpVerb method = HttpVerb.POST) {
         return request(uri, method, fd.toBytes, fd.contentType);
-    }
+    }*/
 
 
     private Uri currentUrl;
     private string currentDomain;
 
-    this(ICache cache = null) {
-
+    void setCookie(string domain, string name, string value)
+    {
+        Cookie c;
+        c.name = name;
+        c.value = value;
+        setCookie(domain, c);
     }
 
-    // FIXME: add proxy
-    // FIXME: some kind of caching
-
-    ///
-    void setCookie(string name, string value, string domain = null) {
-        if(domain == null)
-            domain = currentDomain;
-
-        cookies[domain][name] = value;
+    void setCookie(string domain, ref Cookie c)
+    {
+        if(auto arr = domain in cookies)
+        {
+            // see if the cookie already exists
+            foreach(ref cookie; *arr)
+            {
+                if(cookie.name == c.name)
+                {
+                    // update the cookie with the new data
+                    cookie = c;
+                    return;
+                }
+            }
+            // not in the array
+            *arr ~= c;
+        }
+        else
+        {
+            // no cookies for this domain yet
+            cookies[domain] = [c];
+        }
     }
 
-    ///
     void clearCookies(string domain = null) {
         if(domain is null)
-            cookies = null;
+            cookies.clear;
         else
             cookies[domain] = null;
     }
 
     // If you set these, they will be pre-filled on all requests made with this client
-    string userAgent = "D arsd.html2"; ///
+    string userAgent = "D iopipe.html"; ///
     string authorization; ///
 
     /* inter-request state */
-    string[string][string] cookies;
+    Cookie[][string] cookies;
 }
-
-
