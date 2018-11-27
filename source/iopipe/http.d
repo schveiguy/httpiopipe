@@ -95,7 +95,7 @@ auto httpChunkPipe(Chain)(Chain chain)
 
 // a result from connecting to a server. Headers are poplulated by the time you
 // get this, but the content is still streamed via the underlying pipe.
-struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe == ubyte[]))
+struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe : const(ubyte[])))
 {
     import std.meta : AliasSeq;
 
@@ -118,8 +118,16 @@ struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe == uby
         PipeTypes pipes;
     }
 
-    private Channel channel;
-    private ubyte[] _cachedWindow;
+    private
+    {
+        Channel channel;
+        // if the window type is not ubyte[], then we need to use
+        // const(ubyte)[] since the unzipped buffer must be mutable.
+        static if(is(typeof(BasePipe.init.window()) == ubyte[]))
+            ubyte[] _cachedWindow;
+        else
+            const(ubyte)[] _cachedWindow;
+    }
 
     this(BasePipe stream)
     {
@@ -155,7 +163,7 @@ struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe == uby
         {
             // throw away the current line, parse the next one
             resultPipe.release(resultPipe.window.length);
-            resultPipe.extend(0);
+            cast(void)resultPipe.extend(0);
             auto tmpline = resultPipe.window.strip;
             if(tmpline.length == 0)
                 // end of headers
@@ -236,11 +244,13 @@ struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe == uby
             if(isCompressed)
             {
                 pipes[Channel.compressed] = origSocket.unzip;
+                _cachedWindow = pipes[Channel.compressed].window;
                 channel = Channel.compressed;
             }
             else
             {
                 pipes[Channel.normal] = origSocket;
+                _cachedWindow = pipes[Channel.normal].window;
                 channel = Channel.normal;
             }
         }
@@ -305,6 +315,30 @@ outer:
 auto httpPipe(Chain)(Chain chain)
 {
     return HttpPipe!Chain(chain);
+}
+
+// test httpPipe
+unittest
+{
+    import std.conv : to;
+    enum htmldoc = "<html><head></head><body>Hello, World!</body>";
+    auto response = cast(immutable(ubyte)[]) ("HTTP/1.1 404 Not Found\r\n" ~
+        "Date: Tue, 27 Nov 2018 04:06:13 GMT\r\n" ~
+        "Server: NoServer v1.0\r\n" ~
+        "Content-Length: " ~ htmldoc.length.to!string ~ "\r\n" ~
+        "Content-Type: text/html\r\n" ~
+        "\r\n" ~ htmldoc);
+
+    auto p = response.httpPipe;
+    const h = p.headers;
+    assert(h.code == 404);
+    assert(h.codeText == "Not Found");
+    assert(h.httpVersion == "HTTP/1.1");
+    assert(h.statusLine == "HTTP/1.1 404 Not Found");
+    assert(h.location == "");
+    assert(h.contentType == "text/html");
+    assert(h.contentLength == htmldoc.length);
+    assert(p.window == cast(immutable(ubyte)[])htmldoc);
 }
 
 ///
@@ -550,8 +584,20 @@ class HttpClient
         if(acceptGzip)
             hdr("Accept-Encoding: gzip\r\n");
 
+        hdr("\r\n");
+
         // make sure all data gets sent
         requestBuffer.flush();
+
+        // hack: shutdown the write end of the socket. This helps the server
+        // know there isn't anything more coming.
+        // TODO: need a portable way to do this in std.io (see issue #19)
+        version(Posix)
+        {
+            import core.sys.posix.sys.socket : shutdown, SHUT_WR;
+            auto s = cast(int)sock.refCountedPayload.tupleof[0];
+            shutdown(s, SHUT_WR);
+        }
 
         // TODO: reuse the buffer to receive as well.
         return sock.bufd.httpPipe;
@@ -566,7 +612,7 @@ class HttpClient
         // determine the host ipaddr, based on name service
         import std.io.driver;
         import std.io.net;
-        auto rc = driver.resolve(hostname ~ '\0', ssl ? "http" : "https", AddrFamily.IPv4, SocketType.stream, Protocol.default_, (ref scope ai) {
+        auto rc = driver.resolve(hostname ~ '\0', ssl ? "https" : "http", AddrFamily.IPv4, SocketType.stream, Protocol.default_, (ref scope ai) {
               // set the port according to the parameter
               auto addr4 = ai.addr.get!SocketAddrIPv4;
               if(port != 0)
