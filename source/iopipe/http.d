@@ -99,6 +99,7 @@ struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe == uby
 {
     import std.meta : AliasSeq;
 
+    // TODO, this really should just be const
     private HttpHeader _headers;
     HttpClient client;
     ref const(HttpHeader) headers() const { return _headers; }
@@ -119,6 +120,131 @@ struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe == uby
 
     private Channel channel;
     private ubyte[] _cachedWindow;
+
+    this(BasePipe stream)
+    {
+        import std.algorithm : splitter;
+        // generate a resulting pipe based on the stream data.
+        auto resultPipe = stream
+            .simpleValve // Allow us to get back to the original buffered socket.
+            .assumeText  // assume UTF-8 (ascii)
+            .byLine;     // convert to lines
+
+        resultPipe.extend(0);
+        // first line is the status line
+        auto line = resultPipe.window.strip.idup;
+        HttpHeader responseData;
+        responseData.statusLine = line;
+        auto parts = line.splitter;
+        responseData.httpVersion = parts.front;
+        parts.popFront;
+        responseData.code = to!int(parts.front);
+        parts.popFront;
+        // parts.front now points at the codeText, but may have spaces, so just
+        // use the pointer (unsafe!)
+        // TODO use bufref library when finished.
+        auto parsedOff = parts.front.ptr - line.ptr;
+        responseData.codeText = parts.front.ptr[0 .. (line.length - parsedOff)];
+
+        bool isChunked = false;
+        bool isCompressed = false;
+        CompressionFormat compFormat;
+
+        // parse the remaining headers
+        while(true)
+        {
+            // throw away the current line, parse the next one
+            resultPipe.release(resultPipe.window.length);
+            resultPipe.extend(0);
+            auto tmpline = resultPipe.window.strip;
+            if(tmpline.length == 0)
+                // end of headers
+                break;
+            line = tmpline.idup;
+            responseData.rawHeaders ~= line;
+            auto colon = line.indexOf(':');
+            if(colon == -1)
+                // not a well-formed header, don't worry about processing it.
+                continue;
+
+            auto name = line[0 .. colon];
+            auto value = line[colon + 2 .. $]; // skipping the colon itself and the following space
+            responseData.headers ~= cast(string[2])[name, value];
+            switch(name) {
+            case "Connection":
+            case "connection":
+                if(value == "close")
+                {
+                    // TODO: handle this somehow
+                }
+                break;
+            case "Content-Type":
+            case "content-type":
+                responseData.contentType = value;
+                break;
+            case "Location":
+            case "location":
+                responseData.location = value;
+                break;
+            case "Content-Length":
+            case "content-length":
+                responseData.contentLength = to!int(value);
+                break;
+            case "Transfer-Encoding":
+            case "transfer-encoding":
+                // note that if it is gzipped, it zips first, then chunks the compressed stream.
+                // so we should always dechunk first, then feed into the decompressor
+                if(value == "chunked")
+                    isChunked = true;
+                else throw new Exception("Unknown Transfer-Encoding: " ~ value);
+                break;
+            case "Content-Encoding":
+            case "content-encoding":
+                if(value == "gzip") {
+                    isCompressed = true;
+                    compFormat = CompressionFormat.gzip;
+                } else if(value == "deflate") {
+                    isCompressed = true;
+                    compFormat = CompressionFormat.deflate;
+                } else throw new Exception("Unknown Content-Encoding: " ~ value);
+                break;
+            case "Set-Cookie":
+            case "set-cookie":
+                responseData.cookies ~= parseCookie(value);
+                break;
+            default:
+                // ignore
+
+            }
+        }
+
+        // make sure any lingering header data is out of the pipe
+        resultPipe.release(resultPipe.window.length);
+
+        // fetch the original socket, unwrapping all the text conversions and
+        // line processing, and build the appropriate decoder on top of it.
+        auto origSocket = resultPipe.valve;
+        _headers = responseData;
+
+        // deal with any encoding issues.
+        if(isChunked)
+        {
+            assert(false); // not implemented yet.
+        }
+        else
+        {
+            if(isCompressed)
+            {
+                pipes[Channel.compressed] = origSocket.unzip;
+                channel = Channel.compressed;
+            }
+            else
+            {
+                pipes[Channel.normal] = origSocket;
+                channel = Channel.normal;
+            }
+        }
+    }
 
     static if(hasValve!BasePipe)
     {
@@ -173,6 +299,12 @@ outer:
         }
         return result;
     }
+}
+
+// IFTI convenience function
+auto httpPipe(Chain)(Chain chain)
+{
+    return HttpPipe!Chain(chain);
 }
 
 ///
@@ -362,7 +494,6 @@ class HttpClient
     {
 
         import std.typecons : refCounted;
-        import std.algorithm : splitter;
 
         auto sock = openConnection(where.host, where.scheme == "https", cast(short)where.port).refCounted;
 
@@ -422,130 +553,8 @@ class HttpClient
         // make sure all data gets sent
         requestBuffer.flush();
 
-        // now, generate a resulting pipe based on the response data.
         // TODO: reuse the buffer to receive as well.
-        auto resultPipe = sock
-            .bufd        // buffer it
-            .simpleValve // Allow us to get back to the original buffered socket.
-            .assumeText  // assume UTF-8 (ascii)
-            .byLine;     // convert to lines
-
-        resultPipe.extend(0);
-        // first line is the status line
-        auto line = resultPipe.window.strip.idup;
-        HttpHeader responseData;
-        responseData.statusLine = line;
-        auto parts = line.splitter;
-        responseData.httpVersion = parts.front;
-        parts.popFront;
-        responseData.code = to!int(parts.front);
-        parts.popFront;
-        // parts.front now points at the codeText, but may have spaces, so just
-        // use the pointer (unsafe!)
-        // TODO use bufref library when finished.
-        auto parsedOff = parts.front.ptr - line.ptr;
-        responseData.codeText = parts.front.ptr[0 .. (line.length - parsedOff)];
-
-        bool isChunked = false;
-        bool isCompressed = false;
-        CompressionFormat compFormat;
-
-        // parse the remaining headers
-        while(true)
-        {
-            // throw away the current line, parse the next one
-            resultPipe.release(resultPipe.window.length);
-            resultPipe.extend(0);
-            auto tmpline = resultPipe.window.strip;
-            if(tmpline.length == 0)
-                // end of headers
-                break;
-            line = tmpline.idup;
-            responseData.rawHeaders ~= line;
-            auto colon = line.indexOf(':');
-            if(colon == -1)
-                // not a well-formed header, don't worry about processing it.
-                continue;
-
-            auto name = line[0 .. colon];
-            auto value = line[colon + 2 .. $]; // skipping the colon itself and the following space
-            responseData.headers ~= cast(string[2])[name, value];
-            switch(name) {
-            case "Connection":
-            case "connection":
-                if(value == "close")
-                {
-                    // TODO: handle this somehow
-                }
-                break;
-            case "Content-Type":
-            case "content-type":
-                responseData.contentType = value;
-                break;
-            case "Location":
-            case "location":
-                responseData.location = value;
-                break;
-            case "Content-Length":
-            case "content-length":
-                responseData.contentLength = to!int(value);
-                break;
-            case "Transfer-Encoding":
-            case "transfer-encoding":
-                // note that if it is gzipped, it zips first, then chunks the compressed stream.
-                // so we should always dechunk first, then feed into the decompressor
-                if(value == "chunked")
-                    isChunked = true;
-                else throw new Exception("Unknown Transfer-Encoding: " ~ value);
-                break;
-            case "Content-Encoding":
-            case "content-encoding":
-                if(value == "gzip") {
-                    isCompressed = true;
-                    compFormat = CompressionFormat.gzip;
-                } else if(value == "deflate") {
-                    isCompressed = true;
-                    compFormat = CompressionFormat.deflate;
-                } else throw new Exception("Unknown Content-Encoding: " ~ value);
-                break;
-            case "Set-Cookie":
-            case "set-cookie":
-                responseData.cookies ~= parseCookie(value);
-                break;
-            default:
-                // ignore
-
-            }
-        }
-
-        // make sure any lingering header data is out of the pipe
-        resultPipe.release(resultPipe.window.length);
-
-        // fetch the original socket, unwrapping all the text conversions and
-        // line processing, and build the appropriate decoder on top of it.
-        auto origSocket = resultPipe.valve;
-        HttpPipe!(typeof(origSocket)) pipe;
-        pipe._headers = responseData;
-
-        // deal with any encoding issues.
-        if(isChunked)
-        {
-            assert(false); // not implemented yet.
-        }
-        else
-        {
-            if(isCompressed)
-            {
-                pipe.pipes[Channel.compressed] = origSocket.unzip;
-                pipe.channel = Channel.compressed;
-            }
-            else
-            {
-                pipe.pipes[Channel.normal] = origSocket;
-                pipe.channel = Channel.normal;
-            }
-        }
-        return pipe;
+        return sock.bufd.httpPipe;
     }
 
     private Socket openConnection(string hostname, bool ssl = false, short port = 0)
