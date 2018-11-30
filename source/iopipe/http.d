@@ -539,27 +539,9 @@ class HttpClient
         {
             foreach(d; data)
             {
-                while(d.length)
-                {
-                    const dlen = d.length;
-                    if(requestBuffer.window.length == 0)
-                        requestBuffer.extend(0);
-                    const wlen = requestBuffer.window.length;
-                    // TODO: really should be an exception
-                    assert(wlen > 0);
-                    if(wlen > dlen)
-                    {
-                        requestBuffer.window[0 .. dlen] = d;
-                        requestBuffer.release(dlen);
-                        break;
-                    }
-                    else
-                    {
-                        requestBuffer.window[] = d[0 .. wlen];
-                        d = d[wlen .. $];
-                        requestBuffer.release(wlen);
-                    }
-                }
+                auto written = requestBuffer.writeBuf(d);
+                // TODO: really should be an exception
+                assert(written == d.length);
             }
         }
 
@@ -584,20 +566,14 @@ class HttpClient
         if(acceptGzip)
             hdr("Accept-Encoding: gzip\r\n");
 
+        // this tells the server we aren't sending any more requests
+        if(useHttp11)
+            hdr("Connection: close\r\n");
+
         hdr("\r\n");
 
         // make sure all data gets sent
         requestBuffer.flush();
-
-        // hack: shutdown the write end of the socket. This helps the server
-        // know there isn't anything more coming.
-        // TODO: need a portable way to do this in std.io (see issue #19)
-        version(Posix)
-        {
-            import core.sys.posix.sys.socket : shutdown, SHUT_WR;
-            auto s = cast(int)sock.refCountedPayload.tupleof[0];
-            shutdown(s, SHUT_WR);
-        }
 
         // TODO: reuse the buffer to receive as well.
         return sock.bufd.httpPipe;
