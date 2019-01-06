@@ -18,6 +18,9 @@ import iopipe.zip;
 import std.string;
 import std.conv;
 
+
+version = use_openssl;
+
 enum Channel : ubyte
 {
     normal,
@@ -493,6 +496,126 @@ struct Uri
 struct HttpQueryParameters
 {
 }
+
+version(use_openssl)
+{
+    import core.stdc.stdio;
+    extern(C) {
+        int SSL_library_init();
+        void OpenSSL_add_all_ciphers();
+        void OpenSSL_add_all_digests();
+        void SSL_load_error_strings();
+
+        struct SSL {}
+        struct SSL_CTX {}
+        struct SSL_METHOD {}
+
+        SSL_CTX* SSL_CTX_new(const SSL_METHOD* method);
+        SSL* SSL_new(SSL_CTX*);
+        int SSL_set_fd(SSL*, int);
+        int SSL_connect(SSL*);
+        int SSL_write(SSL*, const void*, int);
+        int SSL_read(SSL*, void*, int);
+        void SSL_free(SSL*);
+        void SSL_CTX_free(SSL_CTX*);
+
+        int SSL_pending(const SSL*);
+
+        void SSL_set_verify(SSL*, int, void*);
+        enum SSL_VERIFY_NONE = 0;
+
+        SSL_METHOD* SSLv3_client_method();
+        SSL_METHOD* TLS_client_method();
+        SSL_METHOD* SSLv23_client_method();
+
+        void ERR_print_errors_fp(FILE*);
+    }
+
+    shared static this() {
+        SSL_library_init();
+        OpenSSL_add_all_ciphers();
+        OpenSSL_add_all_digests();
+        SSL_load_error_strings();
+    }
+
+
+    // hack at this point to pair a socket with an SSL channel
+    // Note that the constructor expects a connected socket.
+    struct OpenSslSocket
+    {
+        import std.io.net.socket;
+        private
+        {
+            Socket sock;
+            SSL* ssl;
+            SSL_CTX* ctx;
+            // this is so ugly, but have not choice right now
+            auto sockFD()
+            {
+                version(Posix)
+                {
+                    return cast(int)sock.tupleof[0];
+                }
+                else
+                {
+                    assert(false, "Unsupported");
+                }
+            }
+            void initSsl(bool verifyPeer)
+            {
+                ctx = SSL_CTX_new(SSLv23_client_method());
+                assert(ctx !is null);
+
+                ssl = SSL_new(ctx);
+                if(!verifyPeer)
+                    SSL_set_verify(ssl, SSL_VERIFY_NONE, null);
+                SSL_set_fd(ssl, sockFD);
+                if(SSL_connect(ssl) == -1)
+                    throw new Exception("ssl connect");
+            }
+        }
+
+        @trusted size_t write(const(ubyte)[] buf)
+        {
+            auto retval = SSL_write(ssl, buf.ptr, cast(uint) buf.length);
+            if(retval < 0) {
+                ERR_print_errors_fp(core.stdc.stdio.stdout);
+                throw new Exception("ssl write");
+            }
+            return retval;
+        }
+
+        @trusted size_t read(ubyte[] buf)
+        {
+            auto retval = SSL_read(ssl, buf.ptr, cast(uint) buf.length);
+            if(retval < 0) {
+                throw new Exception("ssl read");
+            }
+            return retval;
+        }
+
+        this(Socket sock)
+        {
+            // TODO: use std.algorithm.move
+            this.sock = sock.move;
+            initSsl(true);
+        }
+
+        ~this() {
+            if(ssl !is null)
+            {
+                SSL_free(ssl);
+                ssl = null;
+            }
+            if(ctx !is null)
+            {
+                SSL_CTX_free(ctx);
+                ctx = null;
+            }
+            // sock will close the fd.
+        }
+    }
+}
  
 /// HttpClient keeps cookies, location, and some other state to reuse connections, when possible, like a web browser.
 class HttpClient
@@ -523,14 +646,8 @@ class HttpClient
         return request(where, method, parameters);
     }
 
-    auto request(Uri where, HttpVerb method = HttpVerb.GET,
-                        HttpQueryParameters parameters = HttpQueryParameters.init)
+    private auto setupRequest(Stream)(Stream sock, Uri where, HttpVerb method, HttpQueryParameters parameters)
     {
-
-        import std.typecons : refCounted;
-
-        auto sock = openConnection(where.host, where.scheme == "https", cast(short)where.port).refCounted;
-
         // got a socket, need to send the request parameters
         auto requestBuffer = bufd!char.push!(a => a.encodeText.outputPipe(sock), false);
 
@@ -579,11 +696,34 @@ class HttpClient
         return sock.bufd.httpPipe;
     }
 
+    auto request(Uri where, HttpVerb method = HttpVerb.GET,
+                        HttpQueryParameters parameters = HttpQueryParameters.init)
+    {
+
+        import std.typecons : refCounted;
+
+        auto sock = openConnection(where.host, false, cast(short)where.port).refCounted;
+        return setupRequest(sock, where, method, parameters);
+    }
+
+    version(use_openssl)
+        auto requestSSL(Uri where, HttpVerb method = HttpVerb.GET,
+                        HttpQueryParameters parameters = HttpQueryParameters.init)
+        {
+
+            import std.typecons : refCounted;
+
+            auto sock = OpenSslSocket(openConnection(where.host, true, cast(short)where.port)).refCounted;
+            return setupRequest(sock, where, method, parameters);
+        }
+
     private Socket openConnection(string hostname, bool ssl = false, short port = 0)
     {
-        // no support for ssl yet
-        assert(!ssl);
-
+        version(use_openssl)
+        {
+        }
+        else
+            assert(!ssl);
         auto result = Socket(ProtocolFamily.IPv4, SocketType.stream);
         // determine the host ipaddr, based on name service
         import std.io.driver;
