@@ -25,8 +25,8 @@ enum Channel : ubyte
 {
     normal,
     compressed,
-    /*chunked,
-    chunkedCompressed*/
+    chunked,
+    chunkedCompressed
 }
 
 struct Cookie
@@ -90,11 +90,109 @@ struct HttpHeader
 
 }
 
-auto httpChunkPipe(Chain)(Chain chain)
+
+auto decodeChunks(Chain)(Chain chain) if (isIopipe!Chain && is(WindowType!Chain : const(ubyte[])))
 {
-    assert(false, "Unimplemented");
+    // chunks are defined as pieces of the original buffer. The least worst
+    // way to process these is to rewrite the data as the chunked data
+    // comes in. This means overwriting the data as it comes in to remove
+    // the chunk markers. Because we don't have the ability to shrink the
+    // end of the buffer, before we extend more data, we move everything
+    // up that we have processed so far.
+    //
+    // If the data is const, however, we have to re-buffer, which makes
+    // things straightforward. So this is the current implementation, I
+    // will work on the fancier one later.
+    static struct HTTPChunkSource
+    {
+        Chain chain;
+        private size_t chunkRemaining;
+        private bool eof;
+        size_t read(ubyte[] buf)
+        {
+            import std.algorithm : min;
+            import std.exception : enforce;
+            import iopipe.bufpipe;
+            // don't do a read if not necessary
+            if(buf.length == 0)
+                return 0;
+            size_t result = 0;
+            if(chunkRemaining == 0) // make sure there's enough to read a chunk header
+                cast(void)chain.extend(0);
+            while(chain.window.length > 0 && buf.length > 0)
+            {
+                if(chunkRemaining > 2)
+                {
+                    size_t nToRead = min(chunkRemaining - 2, chain.window.length, buf.length);
+                    buf[0 .. nToRead] = chain.window[0 .. nToRead];
+                    buf = buf[nToRead .. $];
+                    chain.release(nToRead);
+                    chunkRemaining -= nToRead;
+                    result += nToRead;
+                }
+                else if(chunkRemaining == 2)
+                {
+                    auto window = chain.window;
+                    // process the \r\n
+                    if(window.length < 2)
+                        return result;
+                    enforce(window[0] == '\r' && window[1] == '\n', "expected carriage return newline sequence in chunked stream!");
+                    chain.release(2);
+                    chunkRemaining = 0;
+                }
+                else
+                {
+                    assert(chunkRemaining == 0);
+                    if(eof)
+                        return result;
+                    auto window = chain.window;
+                    size_t idx = 0;
+                    size_t chunkSize = 0;
+                    while(window[idx] != ';' && window[idx] != '\r')
+                    {
+                        immutable ch = window[idx];
+                        if(ch >= '0' && ch <= '9')
+                            chunkSize = (chunkSize << 4) | (ch - '0');
+                        else if(ch >= 'a' && ch <= 'f')
+                            chunkSize = (chunkSize << 4) | (ch - 'a' + 10);
+                        else if(ch >= 'A' && ch <= 'F')
+                            chunkSize = (chunkSize << 4) | (ch - 'A' + 10);
+                        if(++idx == window.length)
+                            // end of the window
+                            return result;
+                    }
+                    while(window[idx] != '\r')
+                        if(++idx == window.length)
+                            // end of the window
+                            return result;
+                    if(++idx == window.length)
+                        return result;
+                    if(window[idx] != '\n')
+                        throw new Exception("expected carriage return newline sequence in chunked stream!");
+                    ++idx;
+                    if(chunkSize == 0)
+                    {
+                        // final chunk
+                        eof = true;
+                    }
+                    chunkRemaining = chunkSize + 2;
+                    chain.release(idx);
+                }
+            }
+            return result;
+        }
+    }
+    return HTTPChunkSource(chain).bufd!ubyte;
 }
 
+unittest
+{
+    // from wikipedia
+    auto chunkedData = "4\r\nWiki\r\n5\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\n\r\n";
+    auto chunkedPipe = (cast(immutable(ubyte)[])chunkedData).decodeChunks;
+    chunkedPipe.ensureElems;
+    assert(chunkedPipe.window == cast(ubyte[])"Wikipedia in\r\n\r\nchunks.");
+}
 
 // a result from connecting to a server. Headers are poplulated by the time you
 // get this, but the content is still streamed via the underlying pipe.
@@ -107,13 +205,13 @@ struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe : cons
     HttpClient client;
     ref const(HttpHeader) headers() const { return _headers; }
 
-    private alias ChunkedPipe = typeof(BasePipe.init.httpChunkPipe());
+    private alias ChunkedPipe = typeof(BasePipe.init.decodeChunks());
 
     private alias PipeTypes = AliasSeq!(
            BasePipe,
            typeof(unzip(BasePipe.init)),
-           /*ChunkedPipe,
-           typeof(unzip(ChunkedPipe.init))*/
+           ChunkedPipe,
+           typeof(unzip(ChunkedPipe.init))
            );
 
     private union
@@ -141,7 +239,7 @@ struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe : cons
             .assumeText  // assume UTF-8 (ascii)
             .byLine;     // convert to lines
 
-        resultPipe.extend(0);
+        cast(void)resultPipe.extend(0);
         // first line is the status line
         auto line = resultPipe.window.strip.idup;
         HttpHeader responseData;
@@ -240,7 +338,18 @@ struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe : cons
         // deal with any encoding issues.
         if(isChunked)
         {
-            assert(false); // not implemented yet.
+            if(isCompressed)
+            {
+                pipes[Channel.chunkedCompressed] = origSocket.decodeChunks.unzip;
+                _cachedWindow = pipes[Channel.chunkedCompressed].window;
+                channel = Channel.chunkedCompressed;
+            }
+            else
+            {
+                pipes[Channel.chunked] = origSocket.decodeChunks;
+                _cachedWindow = pipes[Channel.chunkedCompressed].window;
+                channel = Channel.normal;
+            }
         }
         else
         {
@@ -541,6 +650,9 @@ version(use_openssl)
 
     // hack at this point to pair a socket with an SSL channel
     // Note that the constructor expects a connected socket.
+
+    // TODO: use vibe.d technique to wrap the BIO interface with a buffered
+    // stream. Need to investigate how it works.
     struct OpenSslSocket
     {
         import std.io.net.socket;
@@ -554,7 +666,7 @@ version(use_openssl)
             {
                 version(Posix)
                 {
-                    return cast(int)sock.tupleof[0];
+                    return *cast(int*)&sock;
                 }
                 else
                 {
