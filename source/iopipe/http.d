@@ -21,14 +21,6 @@ import std.conv;
 
 version = use_openssl;
 
-enum Channel : ubyte
-{
-    normal,
-    compressed,
-    chunked,
-    chunkedCompressed
-}
-
 struct Cookie
 {
     string name;
@@ -89,7 +81,6 @@ struct HttpHeader
     string[2][] headers; // parsed well-formed headers
 
 }
-
 
 auto decodeChunks(Chain)(Chain chain) if (isIopipe!Chain && is(WindowType!Chain : const(ubyte[])))
 {
@@ -181,6 +172,8 @@ auto decodeChunks(Chain)(Chain chain) if (isIopipe!Chain && is(WindowType!Chain 
             }
             return result;
         }
+
+        mixin implementValve!chain;
     }
     return HTTPChunkSource(chain).bufd!ubyte;
 }
@@ -194,34 +187,69 @@ unittest
     assert(chunkedPipe.window == cast(ubyte[])"Wikipedia in\r\n\r\nchunks.");
 }
 
+// a pipe which stops after content-length bytes have been read.
+auto contentPipe(Chain)(Chain chain, size_t contentLength = size_t.max - 1) if (isIopipe!Chain && is(WindowType!Chain : const(ubyte[])))
+{
+    static struct ContentPipe
+    {
+        private size_t remaining;
+        Chain chain;
+
+        ubyte[] window()
+        {
+            auto baseWin = chain.window;
+            if(baseWin.length > remaining)
+                baseWin = baseWin[0 .. remaining];
+            return baseWin;
+        }
+        void release(size_t elems)
+        {
+            assert(elems <= remaining);
+            chain.release(elems);
+            remaining -= elems;
+        }
+
+        size_t extend(size_t elems)
+        {
+            size_t origLen = chain.window.length;
+            if(origLen >= remaining)
+                // no need to try reading more, we won't return it anyway
+                return 0;
+            auto result = chain.extend(elems);
+            import std.algorithm : min;
+            return min(remaining - origLen, result);
+        }
+
+        mixin implementValve!(chain);
+    }
+
+    return ContentPipe(contentLength, chain);
+}
+
 // a result from connecting to a server. Headers are poplulated by the time you
 // get this, but the content is still streamed via the underlying pipe.
 struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe : const(ubyte[])))
 {
     import std.meta : AliasSeq;
+    import taggedalgebraic : TaggedAlgebraic;
 
     // TODO, this really should just be const
     private HttpHeader _headers;
-    HttpClient client;
     ref const(HttpHeader) headers() const { return _headers; }
 
-    private alias ChunkedPipe = typeof(BasePipe.init.decodeChunks());
-
-    private alias PipeTypes = AliasSeq!(
-           BasePipe,
-           typeof(unzip(BasePipe.init)),
-           ChunkedPipe,
-           typeof(unzip(ChunkedPipe.init))
-           );
-
-    private union
-    {
-        PipeTypes pipes;
-    }
 
     private
     {
-        Channel channel;
+        alias ChunkedPipe = typeof(BasePipe.init.decodeChunks());
+        alias ContentPipe = typeof(BasePipe.init.contentPipe());
+        union Pipes
+        {
+            ContentPipe normal;
+            typeof(unzip(ContentPipe.init)) compressed;
+            ChunkedPipe chunked;
+            typeof(unzip(ChunkedPipe.init)) chunkedCompressed;
+        }
+        TaggedAlgebraic!Pipes pipes;
         // if the window type is not ubyte[], then we need to use
         // const(ubyte)[] since the unzipped buffer must be mutable.
         static if(is(typeof(BasePipe.init.window()) == ubyte[]))
@@ -335,51 +363,34 @@ struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe : cons
         auto origSocket = resultPipe.valve;
         _headers = responseData;
 
+
         // deal with any encoding issues.
         if(isChunked)
         {
             if(isCompressed)
-            {
-                pipes[Channel.chunkedCompressed] = origSocket.decodeChunks.unzip;
-                _cachedWindow = pipes[Channel.chunkedCompressed].window;
-                channel = Channel.chunkedCompressed;
-            }
+                pipes = origSocket.decodeChunks.unzip;
             else
-            {
-                pipes[Channel.chunked] = origSocket.decodeChunks;
-                _cachedWindow = pipes[Channel.chunkedCompressed].window;
-                channel = Channel.normal;
-            }
+                pipes = origSocket.decodeChunks;
         }
         else
         {
+            // set up the content length if necessary
+            auto content = origSocket.contentPipe(responseData.contentLength == 0 ?
+                         size_t.max - 1 : responseData.contentLength);
             if(isCompressed)
-            {
-                pipes[Channel.compressed] = origSocket.unzip;
-                _cachedWindow = pipes[Channel.compressed].window;
-                channel = Channel.compressed;
-            }
+                pipes = content.unzip;
             else
-            {
-                pipes[Channel.normal] = origSocket;
-                _cachedWindow = pipes[Channel.normal].window;
-                channel = Channel.normal;
-            }
+                pipes = content;
         }
+        _cachedWindow = pipes.window;
     }
 
     static if(hasValve!BasePipe)
     {
         ref valve()
         {
-            final switch(channel)
-            {
-                static foreach(i; 0 .. PipeTypes.length)
-                {
-                case cast(Channel)i:
-                    return pipes[i].valve;
-                }
-            }
+            static assert(is(typeof(pipes.valve()) == PropertyType!(BasePipe.init.valve)));
+            return pipes.valve;
         }
     }
 
@@ -392,33 +403,14 @@ struct HttpPipe(BasePipe) if (isIopipe!BasePipe && is(WindowType!BasePipe : cons
 
     void release(size_t elements)
     {
-outer:
-        final switch(channel)
-        {
-            static foreach(i; 0 .. PipeTypes.length)
-            {
-            case cast(Channel)i:
-                pipes[i].release(elements);
-                _cachedWindow = pipes[i].window;
-                break outer;
-            }
-        }
+        pipes.release(elements);
+        _cachedWindow = pipes.window;
     }
 
     size_t extend(size_t elements)
     {
-        size_t result;
-outer:
-        final switch(channel)
-        {
-            static foreach(i; 0 .. PipeTypes.length)
-            {
-            case cast(Channel)i:
-                result = pipes[i].extend(elements);
-                _cachedWindow = pipes[i].window;
-                break outer;
-            }
-        }
+        auto result = pipes.extend(elements);
+        _cachedWindow = pipes.window;
         return result;
     }
 }
@@ -758,10 +750,17 @@ class HttpClient
         return request(where, method, parameters);
     }
 
-    private auto setupRequest(Stream)(Stream sock, Uri where, HttpVerb method, HttpQueryParameters parameters)
+    private auto setupRequest(BufferedInputPipe)(BufferedInputPipe pipe, Uri where, HttpVerb method, HttpQueryParameters parameters)
     {
+        // fetch the actual socket from the buffered input pipe
+        auto sock = pipe.dev;
         // got a socket, need to send the request parameters
-        auto requestBuffer = bufd!char.push!(a => a.encodeText.outputPipe(sock), false);
+        //
+        // set up a local buffer for writing, we only need it temporarily
+        ubyte[4096] buf;
+        //auto requestBuffer = buf[].lbufd!(char, buf.length)
+        auto requestBuffer = bufd!(char)
+            .push!(a => a.encodeText.outputPipe(sock), false);
 
         // write header data to the socket
         void hdr(const(char)[][] data...)
@@ -795,17 +794,15 @@ class HttpClient
         if(acceptGzip)
             hdr("Accept-Encoding: gzip\r\n");
 
-        // this tells the server we aren't sending any more requests
-        if(useHttp11)
-            hdr("Connection: close\r\n");
+        // tell the server we may add more items.
+        hdr("Connection: keep-alive\r\n");
 
         hdr("\r\n");
 
         // make sure all data gets sent
         requestBuffer.flush();
 
-        // TODO: reuse the buffer to receive as well.
-        return sock.bufd.httpPipe;
+        return pipe.simpleValve.httpPipe;
     }
 
     auto request(Uri where, HttpVerb method = HttpVerb.GET,
@@ -815,7 +812,7 @@ class HttpClient
         import std.typecons : refCounted;
 
         auto sock = openConnection(where.host, false, cast(short)where.port).refCounted;
-        return setupRequest(sock, where, method, parameters);
+        return setupRequest(sock.bufd, where, method, parameters);
     }
 
     version(use_openssl)
@@ -826,8 +823,18 @@ class HttpClient
             import std.typecons : refCounted;
 
             auto sock = OpenSslSocket(openConnection(where.host, true, cast(short)where.port)).refCounted;
-            return setupRequest(sock, where, method, parameters);
+            auto req = setupRequest(sock.bufd, where, method, parameters);
+            return  req;
         }
+
+    // reuse an existing http socket object to send a new request (using keepalive)
+    auto request(Chain)(ref Chain c, Uri where, HttpVerb method = HttpVerb.GET,
+                        HttpQueryParameters parameters = HttpQueryParameters.init)
+    {
+        // get the original buffered socket
+        auto bufferedSock = c.valveOf!BufferedInputSource;
+        return setupRequest(bufferedSock, where, method, parameters);
+    }
 
     private Socket openConnection(string hostname, bool ssl = false, short port = 0)
     {
