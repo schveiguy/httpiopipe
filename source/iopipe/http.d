@@ -758,8 +758,7 @@ class HttpClient
         //
         // set up a local buffer for writing, we only need it temporarily
         ubyte[4096] buf;
-        //auto requestBuffer = buf[].lbufd!(char, buf.length)
-        auto requestBuffer = bufd!(char)
+        auto requestBuffer = buf[].lbufd!(char, buf.length)
             .push!(a => a.encodeText.outputPipe(sock), false);
 
         // write header data to the socket
